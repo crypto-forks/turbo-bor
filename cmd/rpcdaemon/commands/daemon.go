@@ -35,6 +35,9 @@ func APIList(ctx context.Context, db kv.RoDB,
 	dbImpl := NewDBAPIImpl() /* deprecated */
 	engineImpl := NewEngineAPI(base, db)
 
+	// bor api
+	borImpl := NewBorAPI(base, db)
+
 	for _, enabledAPI := range cfg.API {
 		switch enabledAPI {
 		case "eth":
@@ -98,6 +101,13 @@ func APIList(ctx context.Context, db kv.RoDB,
 				Namespace: "engine",
 				Public:    true,
 				Service:   EngineAPI(engineImpl),
+				Version:   "1.0",
+			})
+		case "bor":
+			defaultAPIList = append(defaultAPIList, rpc.API{
+				Namespace: "bor",
+				Public:    true,
+				Service:   BorAPI(borImpl),
 				Version:   "1.0",
 			})
 		}

@@ -96,6 +96,15 @@ type EthAPI interface {
 	CompileLLL(_ context.Context, _ string) (hexutil.Bytes, error)
 	CompileSolidity(ctx context.Context, _ string) (hexutil.Bytes, error)
 	CompileSerpent(ctx context.Context, _ string) (hexutil.Bytes, error)
+
+	// Bor related (see ./eth_bor.go)
+	// SubscribeStateSyncEvent(ch chan<- core.State) event.Subscription
+	// GetRootHash(ctx context.Context, starBlockNr uint64, endBlockNr uint64) (string, error)
+	// GetBorBlockReceipt(ctx context.Context, hash common.Hash) (*types.Receipt, error)
+	// GetBorBlockLogs(ctx context.Context, hash common.Hash) ([]*types.Log, error)
+	// GetBorBlockTransaction(ctx context.Context, txHash common.Hash) (*types.Transaction, common.Hash, uint64, uint64, error)
+	// GetBorBlockTransactionWithBlockHash(ctx context.Context, txHash common.Hash, blockHash common.Hash) (*types.Transaction, common.Hash, uint64, uint64, error)
+	Test() (string, error)
 }
 
 type BaseAPI struct {
