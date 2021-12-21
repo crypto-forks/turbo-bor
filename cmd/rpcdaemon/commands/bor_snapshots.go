@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,12 @@ import (
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/rpc"
+)
+
+var (
+	// errUnknownBlock is returned when the list of signers is requested for a block
+	// that is not part of the local blockchain.
+	errUnknownBlock = errors.New("unknown block")
 )
 
 type Snapshot struct {
@@ -52,9 +59,85 @@ func (api *BorImpl) GetSnapshot(number *rpc.BlockNumber) (*Snapshot, error) {
 	}
 	// Ensure we have an actually valid block and return its snapshot
 	if header == nil {
-		return nil, errors.New("unknown block")
+		return nil, errUnknownBlock
 	}
 	return snapshot(api, tx, header.Number.Uint64(), header.Hash())
+}
+
+// GetSnapshotAtHash retrieves the state snapshot at a given block.
+func (api *BorImpl) GetSnapshotAtHash(hash common.Hash) (*Snapshot, error) {
+	ctx := context.Background()
+	tx, err := api.db.BeginRo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	header, _ := getHeaderByHash(tx, hash)
+	if header == nil {
+		return nil, errUnknownBlock
+	}
+	return snapshot(api, tx, header.Number.Uint64(), header.Hash())
+}
+
+// GetSigners retrieves the list of authorized signers at the specified block.
+func (api *BorImpl) GetSigners(number *rpc.BlockNumber) ([]common.Address, error) {
+	ctx := context.Background()
+	tx, err := api.db.BeginRo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Retrieve the requested block number (or current if none requested)
+	var header *types.Header
+	if number == nil || *number == rpc.LatestBlockNumber {
+		header = rawdb.ReadCurrentHeader(tx)
+	} else {
+		header, _ = getHeaderByNumber(ctx, *number, api, tx)
+	}
+	// Ensure we have an actually valid block and return its snapshot
+	if header == nil {
+		return nil, errUnknownBlock
+	}
+	snap, err := snapshot(api, tx, header.Number.Uint64(), header.Hash())
+	return signers(snap.ValidatorSet), err
+}
+
+// GetSignersAtHash retrieves the list of authorized signers at the specified block.
+func (api *BorImpl) GetSignersAtHash(hash common.Hash) ([]common.Address, error) {
+	ctx := context.Background()
+	tx, err := api.db.BeginRo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	header, _ := getHeaderByHash(tx, hash)
+	if header == nil {
+		return nil, errUnknownBlock
+	}
+	snap, err := snapshot(api, tx, header.Number.Uint64(), header.Hash())
+	if err != nil {
+		return nil, err
+	}
+	return signers(snap.ValidatorSet), nil
+}
+
+// GetCurrentProposer gets the current proposer
+func (api *BorImpl) GetCurrentProposer() (common.Address, error) {
+	snap, err := api.GetSnapshot(nil)
+	if err != nil {
+		return common.Address{}, err
+	}
+	return getProposer(snap.ValidatorSet).Address, nil
+}
+
+// GetCurrentValidators gets the current validators
+func (api *BorImpl) GetCurrentValidators() ([]*bor.Validator, error) {
+	snap, err := api.GetSnapshot(nil)
+	if err != nil {
+		return make([]*bor.Validator, 0), err
+	}
+	return snap.ValidatorSet.Validators, nil
 }
 
 func (api *BorImpl) Test() (string, error) {
@@ -93,13 +176,10 @@ func snapshot(api *BorImpl, tx kv.Tx, number uint64, hash common.Hash) (*Snapsho
 	// load on-disk checkpoints
 	if s, err := loadSnapshot(api, tx, hash); err == nil {
 		snap = s
-	}
-
-	if snap == nil {
+		return snap, nil
+	} else {
 		return nil, fmt.Errorf("unknown error while retrieving snapshot at block number %v", number)
 	}
-
-	return snap, nil
 }
 
 // loadSnapshot loads an existing snapshot from the database.
@@ -123,6 +203,15 @@ func loadSnapshot(api *BorImpl, tx kv.Tx, hash common.Hash) (*Snapshot, error) {
 	return snap, nil
 }
 
+// signers retrieves the list of authorized signers in ascending order.
+func signers(vals *ValidatorSet) []common.Address {
+	sigs := make([]common.Address, 0, len(vals.Validators))
+	for _, sig := range vals.Validators {
+		sigs = append(sigs, sig.Address)
+	}
+	return sigs
+}
+
 // Force recalculation of the set's total voting power.
 func updateTotalVotingPower(vals *ValidatorSet) error {
 
@@ -136,6 +225,42 @@ func updateTotalVotingPower(vals *ValidatorSet) error {
 	}
 	vals.totalVotingPower = sum
 	return nil
+}
+
+// getHeaderByHash returns a block's header given a block's hash.
+// derived from erigon_getHeaderByHash implementation (see ./erigon_block.go)
+func getHeaderByHash(tx kv.Tx, hash common.Hash) (*types.Header, error) {
+	header, err := rawdb.ReadHeaderByHash(tx, hash)
+	if err != nil {
+		return nil, err
+	}
+	if header == nil {
+		return nil, fmt.Errorf("block header not found: %s", hash.String())
+	}
+
+	return header, nil
+}
+
+// getProposer returns the current proposer.
+// If the validator set is empty, nil is returned.
+func getProposer(vals *ValidatorSet) (proposer *bor.Validator) {
+	if len(vals.Validators) == 0 {
+		return nil
+	}
+	if vals.Proposer == nil {
+		vals.Proposer = findProposer(vals)
+	}
+	return vals.Proposer.Copy()
+}
+
+func findProposer(vals *ValidatorSet) *bor.Validator {
+	var proposer *bor.Validator
+	for _, val := range vals.Validators {
+		if proposer == nil || !bytes.Equal(val.Address.Bytes(), proposer.Address.Bytes()) {
+			proposer = proposer.Cmp(val)
+		}
+	}
+	return proposer
 }
 
 // safe addition
