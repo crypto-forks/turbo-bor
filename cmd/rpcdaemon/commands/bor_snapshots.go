@@ -3,24 +3,38 @@ package commands
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
+	"sync"
 
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/consensus/bor"
 	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/types"
+	"github.com/ledgerwatch/erigon/crypto"
 	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/rpc"
+	"github.com/xsleonard/go-merkle"
+	"golang.org/x/crypto/sha3"
 )
 
 var (
 	// errUnknownBlock is returned when the list of signers is requested for a block
 	// that is not part of the local blockchain.
 	errUnknownBlock = errors.New("unknown block")
+
+	// errMissingSignature is returned if a block's extra-data section doesn't seem
+	// to contain a 65 byte secp256k1 signature.
+	errMissingSignature = errors.New("extra-data 65 byte signature suffix missing")
+)
+
+var (
+	extraSeal = 65 // Fixed number of extra-data suffix bytes reserved for signer seal
 )
 
 type Snapshot struct {
@@ -55,13 +69,37 @@ func (api *BorImpl) GetSnapshot(number *rpc.BlockNumber) (*Snapshot, error) {
 	if number == nil || *number == rpc.LatestBlockNumber {
 		header = rawdb.ReadCurrentHeader(tx)
 	} else {
-		header, _ = getHeaderByNumber(ctx, *number, api, tx)
+		header, _ = getHeaderByNumber(*number, api, tx)
 	}
 	// Ensure we have an actually valid block and return its snapshot
 	if header == nil {
 		return nil, errUnknownBlock
 	}
 	return snapshot(api, tx, header.Number.Uint64(), header.Hash())
+}
+
+// GetAuthor retrieves the author a block.
+func (api *BorImpl) GetAuthor(number *rpc.BlockNumber) (*common.Address, error) {
+	ctx := context.Background()
+	tx, err := api.db.BeginRo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Retrieve the requested block number (or current if none requested)
+	var header *types.Header
+	if number == nil || *number == rpc.LatestBlockNumber {
+		header = rawdb.ReadCurrentHeader(tx)
+	} else {
+		header, _ = getHeaderByNumber(*number, api, tx)
+	}
+	// Ensure we have an actually valid block
+	if header == nil {
+		return nil, errUnknownBlock
+	}
+	author, err := author(api, tx, header)
+	return &author, err
 }
 
 // GetSnapshotAtHash retrieves the state snapshot at a given block.
@@ -93,7 +131,7 @@ func (api *BorImpl) GetSigners(number *rpc.BlockNumber) ([]common.Address, error
 	if number == nil || *number == rpc.LatestBlockNumber {
 		header = rawdb.ReadCurrentHeader(tx)
 	} else {
-		header, _ = getHeaderByNumber(ctx, *number, api, tx)
+		header, _ = getHeaderByNumber(*number, api, tx)
 	}
 	// Ensure we have an actually valid block and return its snapshot
 	if header == nil {
@@ -140,14 +178,68 @@ func (api *BorImpl) GetCurrentValidators() ([]*bor.Validator, error) {
 	return snap.ValidatorSet.Validators, nil
 }
 
+// GetRootHash returns the merkle root of the start to end block headers
+func (api *BorImpl) GetRootHash(start, end uint64) (string, error) {
+	length := uint64(end - start + 1)
+	if length > bor.MaxCheckpointLength {
+		return "", &bor.MaxCheckpointLengthExceededError{start, end}
+	}
+	ctx := context.Background()
+	tx, err := api.db.BeginRo(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	currentHeaderNumber := rawdb.ReadCurrentHeader(tx).Number.Uint64()
+	if start > end || end > currentHeaderNumber {
+		return "", &bor.InvalidStartEndBlockError{start, end, currentHeaderNumber}
+	}
+	blockHeaders := make([]*types.Header, end-start+1)
+	wg := new(sync.WaitGroup)
+	concurrent := make(chan bool, 20)
+	for i := start; i <= end; i++ {
+		wg.Add(1)
+		concurrent <- true
+		go func(number uint64) {
+			blockHeaders[number-start], _ = getHeaderByNumber(rpc.BlockNumber(number), api, tx)
+			<-concurrent
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
+	close(concurrent)
+
+	headers := make([][32]byte, nextPowerOfTwo(length))
+	for i := 0; i < len(blockHeaders); i++ {
+		blockHeader := blockHeaders[i]
+		header := crypto.Keccak256(appendBytes32(
+			blockHeader.Number.Bytes(),
+			new(big.Int).SetUint64(blockHeader.Time).Bytes(),
+			blockHeader.TxHash.Bytes(),
+			blockHeader.ReceiptHash.Bytes(),
+		))
+
+		var arr [32]byte
+		copy(arr[:], header)
+		headers[i] = arr
+	}
+	tree := merkle.NewTreeWithOpts(merkle.TreeOptions{EnableHashSorting: false, DisableHashLeaves: true})
+	if err := tree.Generate(convert(headers), sha3.NewLegacyKeccak256()); err != nil {
+		return "", err
+	}
+	root := hex.EncodeToString(tree.Root().Hash)
+	return root, nil
+}
+
 func (api *BorImpl) Test() (string, error) {
 	return "Hello World", nil
 }
 
 // helper functions
+
 // getHeaderByNumber returns a block's header given a block number ignoring the block's transaction and uncle list (may be faster).
 // derived from erigon_getHeaderByNumber implementation (see ./erigon_block.go)
-func getHeaderByNumber(ctx context.Context, number rpc.BlockNumber, api *BorImpl, tx kv.Tx) (*types.Header, error) {
+func getHeaderByNumber(number rpc.BlockNumber, api *BorImpl, tx kv.Tx) (*types.Header, error) {
 	// Pending block is only known by the miner
 	if number == rpc.PendingBlockNumber {
 		block := api.pendingBlock()
@@ -261,6 +353,79 @@ func findProposer(vals *ValidatorSet) *bor.Validator {
 		}
 	}
 	return proposer
+}
+
+// author returns the Ethereum address recovered
+// from the signature in the header's extra-data section.
+func author(api *BorImpl, tx kv.Tx, header *types.Header) (common.Address, error) {
+	config, _ := api.BaseAPI.chainConfig(tx)
+	return ecrecover(header, config.Bor)
+}
+
+// ecrecover extracts the Ethereum account address from a signed header.
+func ecrecover(header *types.Header, c *params.BorConfig) (common.Address, error) {
+	// Retrieve the signature from the header extra-data
+	if len(header.Extra) < extraSeal {
+		return common.Address{}, errMissingSignature
+	}
+	signature := header.Extra[len(header.Extra)-extraSeal:]
+
+	// Recover the public key and the Ethereum address
+	pubkey, err := crypto.Ecrecover(bor.SealHash(header, c).Bytes(), signature)
+	if err != nil {
+		return common.Address{}, err
+	}
+	var signer common.Address
+	copy(signer[:], crypto.Keccak256(pubkey[1:])[12:])
+
+	return signer, nil
+}
+
+func appendBytes32(data ...[]byte) []byte {
+	var result []byte
+	for _, v := range data {
+		paddedV, err := convertTo32(v)
+		if err == nil {
+			result = append(result, paddedV[:]...)
+		}
+	}
+	return result
+}
+
+func nextPowerOfTwo(n uint64) uint64 {
+	if n == 0 {
+		return 1
+	}
+	// http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
+	n--
+	n |= n >> 1
+	n |= n >> 2
+	n |= n >> 4
+	n |= n >> 8
+	n |= n >> 16
+	n |= n >> 32
+	n++
+	return n
+}
+
+func convertTo32(input []byte) (output [32]byte, err error) {
+	l := len(input)
+	if l > 32 || l == 0 {
+		return
+	}
+	copy(output[32-l:], input[:])
+	return
+}
+
+func convert(input []([32]byte)) [][]byte {
+	var output [][]byte
+	for _, in := range input {
+		newInput := make([]byte, len(in[:]))
+		copy(newInput, in[:])
+		output = append(output, newInput)
+
+	}
+	return output
 }
 
 // safe addition

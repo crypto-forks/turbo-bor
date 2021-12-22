@@ -10,13 +10,13 @@ import (
 // BorAPI Bor specific routines
 type BorAPI interface {
 	GetSnapshot(number *rpc.BlockNumber) (*Snapshot, error)
-	// GetAuthor(number rpc.BlockNumber) (*common.Address, error)
+	GetAuthor(number *rpc.BlockNumber) (*common.Address, error)
 	GetSnapshotAtHash(hash common.Hash) (*Snapshot, error)
 	GetSigners(number *rpc.BlockNumber) ([]common.Address, error)
 	GetSignersAtHash(hash common.Hash) ([]common.Address, error)
 	GetCurrentProposer() (common.Address, error)
 	GetCurrentValidators() ([]*bor.Validator, error)
-	// GetRootHash(start uint64, end uint64) (string, error)
+	GetRootHash(start uint64, end uint64) (string, error)
 	Test() (string, error)
 }
 
