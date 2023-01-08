@@ -14,11 +14,18 @@ import (
 )
 
 // APIList describes the list of available RPC apis
-func APIList(ctx context.Context, db kv.RoDB,
-	eth services.ApiBackend, txPool txpool.TxpoolClient, mining txpool.MiningClient, filters *filters.Filters,
+func APIList(
+	ctx context.Context,
+	db kv.RoDB,
+	borDb kv.RoDB,
+	eth services.ApiBackend,
+	txPool txpool.TxpoolClient,
+	mining txpool.MiningClient,
+	filters *filters.Filters,
 	stateCache kvcache.Cache,
 	blockReader interfaces.BlockReader,
-	cfg cli.Flags, customAPIList []rpc.API) []rpc.API {
+	cfg cli.Flags, customAPIList []rpc.API,
+) []rpc.API {
 	var defaultAPIList []rpc.API
 
 	base := NewBaseApi(filters, stateCache, blockReader, cfg.SingleNodeMode)
@@ -26,7 +33,6 @@ func APIList(ctx context.Context, db kv.RoDB,
 		base.EnableTevmExperiment()
 	}
 	ethImpl := NewEthAPI(base, db, eth, txPool, mining, cfg.Gascap)
-	erigonImpl := NewErigonAPI(base, db)
 	txpoolImpl := NewTxPoolAPI(base, db, txPool)
 	netImpl := NewNetAPIImpl(eth)
 	debugImpl := NewPrivateDebugAPI(base, db, cfg.Gascap)
@@ -34,6 +40,7 @@ func APIList(ctx context.Context, db kv.RoDB,
 	web3Impl := NewWeb3APIImpl(eth)
 	dbImpl := NewDBAPIImpl() /* deprecated */
 	engineImpl := NewEngineAPI(base, db)
+	borImpl := NewBorAPI(base, db, borDb) // bor (consensus) specific
 
 	for _, enabledAPI := range cfg.API {
 		switch enabledAPI {
@@ -86,18 +93,18 @@ func APIList(ctx context.Context, db kv.RoDB,
 				Service:   DBAPI(dbImpl),
 				Version:   "1.0",
 			})
-		case "erigon":
-			defaultAPIList = append(defaultAPIList, rpc.API{
-				Namespace: "erigon",
-				Public:    true,
-				Service:   ErigonAPI(erigonImpl),
-				Version:   "1.0",
-			})
 		case "engine":
 			defaultAPIList = append(defaultAPIList, rpc.API{
 				Namespace: "engine",
 				Public:    true,
 				Service:   EngineAPI(engineImpl),
+				Version:   "1.0",
+			})
+		case "bor":
+			defaultAPIList = append(defaultAPIList, rpc.API{
+				Namespace: "bor",
+				Public:    true,
+				Service:   BorAPI(borImpl),
 				Version:   "1.0",
 			})
 		}
